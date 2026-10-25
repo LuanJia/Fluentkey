@@ -1,0 +1,69 @@
+# FluentKey · 随手写，自然说
+
+一个用 Rust 编写的 Windows 托盘工具。将光标放在输入框，按 **Alt+F**，自动复制整个输入框的文字，调用 OpenAI 兼容的 Chat Completions API，再将自然、简洁的美式英文粘贴回原位置。不会按 Enter，也不会发送聊天消息。
+
+## 先看设计
+
+- [可点击的交互设计稿](docs/design.html)：直接用浏览器打开，无需启动服务；演示交互，不调用 API。
+- [需求分析与交互说明](docs/DESIGN.md)
+- [技术架构与限制](docs/ARCHITECTURE.md)
+- [验证记录与手动验收](docs/TESTING.md)
+- [矢量品牌图标](assets/icon.svg)
+
+## 运行
+
+Windows 10/11 x64。源码构建需要 Rust stable MSVC 和 Visual Studio C++ Build Tools 的 Desktop development with C++ 组件。
+
+```powershell
+cd D:\Codex\fluentkey
+cargo run --release
+```
+
+已构建时，也可以直接运行 `dist\FluentKey.exe`（或 `target\release\fluentkey.exe`），不需要安装 Rust。`dist\FluentKey-0.1.0-windows-x64.zip` 包含 EXE、源码和文档。应用没有安装程序、自动更新或代码签名。
+
+1. 首次运行出现设置界面。填写 **Base URL、API Key、Model**。Base URL 包含供应商要求的版本路径，例如 `https://your-provider.example/v1`；程序仅追加 `/chat/completions`，不会猜测 `/v1`。
+2. 点击“测试连接”。测试仅发送固定的测试短句，使用当前面板内容，不需要先保存。
+3. 点击“保存设置”，再“收起到托盘”。关闭设置窗口也会收起，右键托盘菜单可以重新打开。
+4. 在记事本或普通聊天输入框输入中文或英文，确认中文输入法组合已结束，按 Alt+F，松开快捷键并暂时不要操作键鼠。
+5. 请求成功后原位替换。原应用支持撤销时，可按 Ctrl+Z 撤销。网络失败不修改原文。
+
+设置里的快捷键写作 `Alt+KeyF`。也支持 `Control+Shift+KeyE` 等组合。保存时立即检查快捷键占用；失败会保留原来的快捷键。
+
+托盘图标薄荷绿表示就绪／上次成功，蓝色表示工作中，琥珀色表示发生错误。鼠标悬停可查看状态；右键可以设置、暂停、取消和退出。一次仅执行一个任务。
+
+## 数据和凭据
+
+API Key 保存在 **Windows 凭据管理器**中，服务名 `FluentKey`、账号 `api-key`。其他设置写入 Windows 用户配置目录，实际路径由 `directories::ProjectDirs` 确定，通常为 `%APPDATA%\FluentKey\config\config.json`。Key 不写入该 JSON。
+
+输入和结果仅在内存中使用，不写历史文件、不输出请求日志。最近结果页只保留本次进程的最后一个成功结果；切换页不会自动粘贴。取消不能撤回已到达服务端的请求，供应商的数据保留政策需自行确认。改用其他供应商时，请同时更新 Base URL、Model 和 Key。
+
+临时复制、粘贴使用系统剪贴板；开启 Windows 剪贴板历史或云同步时，系统或剪贴板管理器可能记录内容。恢复当前剪贴板不会清除这些历史。
+
+## 兼容范围
+
+**无法保证“任何应用”的输入框都可操作。** 当前实现使用 Ctrl+A / Ctrl+C / Ctrl+V，适用于遵循这些快捷键的普通编辑控件。请先在非敏感的测试输入框试用。
+
+- Ctrl+A 的范围由目标应用决定。多区域编辑器可能选中整篇文档，终端快捷键也不同。不要用于终端、密码框或含敏感内容的页面。
+- 标准 Win32 密码编辑框会拒绝处理；浏览器和自绘控件的密码状态未做 UI Automation 检测，不能保证识别。
+- 普通权限进程不能向管理员权限窗口注入输入；失败时不会尝试提权。
+- 请求期间任何键盘／鼠标输入或焦点变化都会阻止自动回填。结果保留在托盘面板中，可以手动复制。程序不抢回原窗口。
+- 不支持富文本结构、图片排版或多光标的保真替换。输出以纯文本粘贴，格式由目标应用决定。
+- 剪贴板会备份常见 HGLOBAL 格式（文本、HTML、RTF、DIB 图片、文件列表）；无法备份的特殊句柄格式会在操作前报错。不会承诺所有第三方剪贴板格式可恢复。
+- 不保证捕获到目标应用自行发生的文本变化、极短时间内的窗口变化，或识别只读内容。自动操作存在极小的检查与输入之间的竞态；请在可撤销的普通文本框中使用。
+- 取消是协作式取消：等待中的网络请求最多到配置的超时结束，取消后不再自动粘贴；取消前已完成的粘贴无法回滚。
+
+## 开发验证
+
+```powershell
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+cargo clippy --locked -- -D warnings
+cargo build --release --locked
+```
+
+`Cargo.lock` 固定了本次验证的依赖版本。API 使用非流式 `POST /chat/completions`，只发送 `model`、`messages` 和 `stream=false`，兼容不接受额外生成参数的服务。默认不自动重试，避免重复计费。暂不支持 Responses API、Gemini 原生协议、SSE 流式响应、HTTP Basic Auth、自定义 Header 或多供应商配置档案。
+
+## 卸载
+
+先从托盘退出，删除程序和上述配置目录。如需删除 Key，在 Windows 凭据管理器中删除 FluentKey 对应的通用凭据。默认没有注册开机自启。
