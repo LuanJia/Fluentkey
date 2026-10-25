@@ -1,6 +1,6 @@
 # 验证记录与验收清单
 
-验证环境：2026-10-25，Windows x64，Rust 1.95.0 MSVC。
+验证环境：2026-10-25，Windows x64，Rust 1.95.0 MSVC。v0.1.0 的窗口记录保留在下方，v0.1.1 增量验证见末尾。
 
 ## 自动验证
 
@@ -9,7 +9,7 @@
 | `cargo fmt --check` | 通过 |
 | `cargo check --locked` | 通过 |
 | `cargo clippy --locked --all-targets -- -D warnings` | 通过，无源码 lint 错误 |
-| `cargo test --locked` | 3 个测试通过 |
+| `cargo test --locked` | 6 个测试通过（v0.1.1） |
 | `cargo build --release --locked` | 已生成原生 x64 EXE |
 
 测试覆盖 URL 拼接、HTTPS 限制、完整端点、禁止 URL 凭据／查询；标准 JSON、空 choices、null 内容、截断响应；以及本机 HTTP 模拟服务的请求路径、Bearer 头、system/user 消息、模型和非流式参数、成功输出与 401 错误内容脱敏。
@@ -51,3 +51,14 @@
 2026-10-25：最终 Release 版本中关闭设置窗口，确认可见窗口列表不再有 FluentKey；切换到为测试新开的空白 Windows 记事本，按 Alt+F。FluentKey 设置窗口立即重新出现，状态显示“请填写模型名称”。这验证了隐藏状态仍能收到全局快捷键并运行配置校验，没有读取记事本文字或发送真实模型请求。
 
 复验后的源码重新运行 3 项测试和 all-targets Clippy，均通过。没有将待用户填写真实 API 参数后的端到端验收标记为通过。
+
+## v0.1.1 开机启动验证
+
+- `cargo test --locked`：6 个测试通过。
+- `cargo clippy --locked --all-targets -- -D warnings`：通过。
+- `cargo build --release --locked --offline --target-dir target\v0.1.1`：通过。旧版仍从 `target\release` 运行，本次使用独立构建目录，未中断旧进程；新版拷贝到 `dist\FluentKey.exe`。
+- 新增测试验证中文／空格路径完整加引号，以及相对路径、过长路径被拒绝。
+- 隔离的 `HKCU\Software\FluentKey\Tests\Autostart-<pid>` 子键中验证实际注册表写入、读取、移除、重复关闭及启用／关闭时的持久化失败回滚。测试结束清理该子键，不修改真实 Run 启动项。
+- 旧配置不含 `start_at_login` 时默认关闭；新字段序列化往返验证通过。
+- 未实际重启或注销当前 Windows 会话，也未替用户启用真实开机启动。登录后的系统调度与任务管理器禁用状态需在用户启用后验收。
+- `settings.png` 是 v0.1.0 界面截图；v0.1.1 的连接页顶部新增开机启动开关。

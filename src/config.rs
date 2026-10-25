@@ -14,6 +14,7 @@ pub struct Config {
     pub timeout_secs: u64,
     pub max_chars: usize,
     pub auto_replace: bool,
+    pub start_at_login: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -25,6 +26,7 @@ impl Default for Config {
             timeout_secs: 30,
             max_chars: 12000,
             auto_replace: true,
+            start_at_login: false,
         }
     }
 }
@@ -96,6 +98,19 @@ pub fn credential() -> Result<keyring::Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn older_configs_do_not_enable_startup() {
+        let config: Config = serde_json::from_str(r#"{"model":"existing-model"}"#).unwrap();
+        assert!(!config.start_at_login);
+        assert_eq!(config.model, "existing-model");
+        let enabled = Config {
+            start_at_login: true,
+            ..Default::default()
+        };
+        let roundtrip: Config =
+            serde_json::from_str(&serde_json::to_string(&enabled).unwrap()).unwrap();
+        assert!(roundtrip.start_at_login);
+    }
     #[test]
     fn endpoints() {
         let mut c = Config::default();

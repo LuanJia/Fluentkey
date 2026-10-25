@@ -7,6 +7,7 @@
 | `src/main.rs` | eframe/egui 设置窗口、tray-icon 菜单、global-hotkey 注册、单实例互斥、后台任务状态 |
 | `src/platform.rs` | Win32 焦点、密码编辑框检查、输入注入、用户操作检测、剪贴板事务 |
 | `src/config.rs` | 非敏感配置、默认提示词、URL 校验、系统凭据入口 |
+| `src/autostart.rs` | 当前用户登录启动项、带引号的绝对路径、保存失败回滚 |
 | `src/api.rs` | OpenAI 兼容 Chat Completions、超时、响应限制、错误归一化 |
 
 主线程驱动 Win32 消息循环、托盘和界面。全局快捷键与托盘菜单使用原生事件回调，直接通过主线程的控制器分派。按快捷键后将当前配置复制给后台线程；后台执行捕获 → 网络请求 → 条件回填，通过通道传回结果，并向独立的 message-only 窗口 PostMessage 唤醒主线程。最多一个后台任务，网络不会阻塞 UI。
@@ -48,7 +49,11 @@ Content-Type: application/json
 
 配置先写临时文件再 rename；加载损坏时回退默认并显示设置，原损坏文件在用户保存前保留。Key 由 keyring windows-native 后端存储，不参与序列化。快捷键修改先注册新组合，再持久化，成功后解除旧组合；失败撤销新注册。Key 存储和 JSON 存储不具有跨系统原子事务：极少数 JSON 写入失败场景，Key 可能已经更新，状态会明确报告保存失败。
 
-命名为 `Local\FluentKey.SingleInstance` 的 mutex 防止同一登录会话重复启动。第二次启动直接退出，不会唤醒第一个窗口；从托盘打开设置。关闭设置隐藏窗口；退出发生在后台任务完成收尾之后。未注册开机自启或系统服务。
+命名为 `Local\FluentKey.SingleInstance` 的 mutex 防止同一登录会话重复启动。第二次启动直接退出，不会唤醒第一个窗口；从托盘打开设置。关闭设置隐藏窗口；退出发生在后台任务完成收尾之后。未注册系统服务。
+
+`start_at_login` 默认 false，旧 JSON 通过 serde 默认值兼容。开机启动在保存设置时写入或删除 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `FluentKey` 值（REG_SZ）。命令将当前 EXE 绝对路径完整加引号，以 UTF-16 保存，支持中文和空格路径，超过 Run 命令的 260 字符限制则拒绝。用户登录后由 Windows 启动；已有配置时按原生命周期隐藏到托盘。
+
+打开程序时根据当前可执行路径的实际注册值初始化开关，避免旧配置文件重新启用用户移除的启动项。Windows 任务管理器的 StartupApproved 禁用状态是另一个系统级控制，本实现不会覆盖它。启动项修改与凭据、JSON 保存组合执行：先快照原注册值，修改启动项；后续持久化失败则恢复原类型及内容，恢复失败会显示明确错误。只写 FluentKey 自身命名值，不写 HKLM 或要求提权。自动测试使用隔离的测试子键，不触碰真实 Run 键。
 
 ## 参考接口
 

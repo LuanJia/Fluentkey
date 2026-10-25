@@ -19,7 +19,7 @@ cd D:\Codex\fluentkey
 cargo run --release
 ```
 
-已构建时，也可以直接运行 `dist\FluentKey.exe`（或 `target\release\fluentkey.exe`），不需要安装 Rust。`dist\FluentKey-0.1.0-windows-x64.zip` 包含 EXE、源码和文档。应用没有安装程序、自动更新或代码签名。
+已构建时，也可以直接运行 `dist\FluentKey.exe`（或默认构建目录的 `target\release\fluentkey.exe`），不需要安装 Rust。`dist\FluentKey-0.1.1-windows-x64.zip` 包含 EXE、源码和文档。应用没有安装程序、自动更新或代码签名。
 
 1. 首次运行出现设置界面。填写 **Base URL、API Key、Model**。Base URL 包含供应商要求的版本路径，例如 `https://your-provider.example/v1`；程序仅追加 `/chat/completions`，不会猜测 `/v1`。
 2. 点击“测试连接”。测试仅发送固定的测试短句，使用当前面板内容，不需要先保存。
@@ -30,6 +30,16 @@ cargo run --release
 设置里的快捷键写作 `Alt+KeyF`。也支持 `Control+Shift+KeyE` 等组合。保存时立即检查快捷键占用；失败会保留原来的快捷键。
 
 托盘图标薄荷绿表示就绪／上次成功，蓝色表示工作中，琥珀色表示发生错误。鼠标悬停可查看状态；右键可以设置、暂停、取消和退出。一次仅执行一个任务。
+
+## 开机启动
+
+在“连接与快捷键”页勾选 **开机启动（登录 Windows 后在托盘运行）**，点击“保存设置”生效。取消勾选并保存即可关闭，默认不启用。此设置与 API 配置一同保存，需要先填好有效的 API 配置字段。
+
+开机启动使用当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下名为 `FluentKey` 的启动项，无需管理员权限。它在登录当前 Windows 用户后运行程序，使用已保存的配置并常驻托盘。Windows 可能延迟启动；如果你在任务管理器里另外禁用了此项，需要在任务管理器中重新启用。
+
+启动项指向启用时正在运行的 EXE 绝对路径，请先将程序放到固定目录。移动或更换路径后，请从新位置启动程序，重新勾选并保存。设置面板在打开程序时读取当前路径的实际注册状态，不会仅凭配置文件自动重新注册。保存设置失败时会尝试恢复原启动项并报告错误。
+
+升级时先从托盘退出旧版，再运行新版；单实例保护会拒绝同时运行两个版本。
 
 ## 数据和凭据
 
@@ -66,4 +76,4 @@ cargo build --release --locked
 
 ## 卸载
 
-先从托盘退出，删除程序和上述配置目录。如需删除 Key，在 Windows 凭据管理器中删除 FluentKey 对应的通用凭据。默认没有注册开机自启。
+先取消“开机启动”并保存，再从托盘退出，删除程序和上述配置目录。如需删除 Key，在 Windows 凭据管理器中删除 FluentKey 对应的通用凭据。如果已删除程序，可手动删除上述 Run 键中名为 `FluentKey` 的值。

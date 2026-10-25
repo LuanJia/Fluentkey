@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod api;
+mod autostart;
 mod config;
 mod platform;
 
@@ -136,10 +137,23 @@ struct App {
 impl App {
     fn new(
         cc: &eframe::CreationContext<'_>,
-        saved: Config,
-        load_error: Option<String>,
+        mut saved: Config,
+        mut load_error: Option<String>,
     ) -> Result<Self> {
         let ctx = &cc.egui_ctx;
+        // Reflect the current executable's registered state, rather than silently
+        // re-enabling a startup item the user removed outside the application.
+        match autostart::is_enabled() {
+            Ok(enabled) => saved.start_at_login = enabled,
+            Err(error) => {
+                saved.start_at_login = false;
+                let detail = format!("无法读取开机启动状态：{error}");
+                load_error = Some(match load_error {
+                    Some(previous) => format!("{previous}；{detail}"),
+                    None => detail,
+                });
+            }
+        }
         ctx.set_theme(egui::Theme::Dark);
         ctx.set_visuals(egui::Visuals::dark());
         let mut style = (*ctx.style()).clone();
@@ -241,10 +255,10 @@ impl App {
                 .context("快捷键已被占用，请换一个组合")?;
         }
         // Roll back new registration if persistence fails. Old shortcut keeps working.
-        let persist = (|| -> Result<()> {
+        let persist = autostart::save_with(self.draft.start_at_login, || -> Result<()> {
             credential()?.set_password(self.key.trim())?;
             self.draft.save()
-        })();
+        });
         if let Err(error) = persist {
             if changed || self.paused {
                 let _ = self.manager.unregister(hotkey);
@@ -455,6 +469,9 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().max_height((ui.available_height() - 110.).max(100.)).show(ui, |ui| {
                 if self.tab == 0 {
                     ui.add_enabled_ui(!self.busy, |ui| {
+                        ui.checkbox(&mut self.draft.start_at_login, "开机启动（登录 Windows 后在托盘运行）");
+                        ui.label(RichText::new("勾选或取消后点击“保存设置”生效；请将程序放在固定目录。").size(12.).color(Color32::GRAY));
+                        ui.separator();
                         field(ui, "Base URL", &mut self.draft.base_url, "https://your-provider.com/v1");
                         ui.label(RichText::new("自动追加 /chat/completions，也支持填写完整端点。").size(12.).color(Color32::GRAY));
                         ui.label("API Key");
