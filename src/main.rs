@@ -10,12 +10,11 @@ use eframe::egui::{self, Color32, RichText};
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::{
     cell::RefCell,
-    collections::VecDeque,
     rc::{Rc, Weak},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -26,37 +25,50 @@ use tray_icon::{
 
 const MINT: Color32 = Color32::from_rgb(114, 232, 190);
 enum Action {
-    Hotkey(GlobalHotKeyEvent),
+    Hotkey(GlobalHotKeyEvent, Result<platform::Target, String>),
     Menu(MenuEvent),
     Worker,
 }
 thread_local! {
     static ACTIVE: RefCell<Weak<RefCell<App>>> = const { RefCell::new(Weak::new()) };
-    static PENDING: RefCell<VecDeque<Action>> = const { RefCell::new(VecDeque::new()) };
 }
-// Native callbacks execute on the UI thread; only the released-key callback is
-// delivered from a helper thread (and is ignored before dispatch).
-fn dispatch(action: Action) {
-    PENDING.with(|queue| queue.borrow_mut().push_back(action));
+// Any callback thread can enqueue. Only the native dispatcher window accesses App.
+static EVENTS: OnceLock<(mpsc::Sender<Action>, isize)> = OnceLock::new();
+fn post_action(action: Action) {
+    if let Some((sender, window)) = EVENTS.get() {
+        if sender.send(action).is_ok() {
+            platform::wake(*window);
+        }
+    }
+}
+fn drain_actions() {
     ACTIVE.with(|active| {
         let Some(shared) = active.borrow().upgrade() else {
             return;
         };
         let Ok(mut app) = shared.try_borrow_mut() else {
+            // Reentrant Win32 callbacks must retry even while the UI is hidden.
+            if let Some((_, window)) = EVENTS.get() {
+                platform::wake(*window);
+            }
             return;
         };
         let ctx = app.context.clone();
-        loop {
-            let action = PENDING.with(|queue| queue.borrow_mut().pop_front());
+        while let Ok(action) = app.actions.try_recv() {
             match action {
-                Some(Action::Hotkey(event)) => {
-                    if event.id == app.hotkey.id() && !app.paused {
-                        app.start(&ctx, false);
+                Action::Hotkey(event, target) => {
+                    if event.id == app.hotkey.id() && !app.paused && !app.busy {
+                        match target {
+                            Ok(target) => app.start(&ctx, false, Some(target)),
+                            Err(error) => {
+                                app.status = error;
+                                let _ = app.tray.set_icon(Some(icon([255, 188, 110])));
+                            }
+                        }
                     }
                 }
-                Some(Action::Menu(event)) => app.menu_event(event, &ctx),
-                Some(Action::Worker) => app.pump_worker(),
-                None => break,
+                Action::Menu(event) => app.menu_event(event, &ctx),
+                Action::Worker => app.pump_worker(),
             }
         }
         let _ = app
@@ -69,10 +81,6 @@ struct Shell(Rc<RefCell<App>>);
 impl eframe::App for Shell {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.0.borrow_mut().update(ctx, frame);
-        // Drain a callback deferred by try_borrow_mut during a reentrant Win32 call.
-        if PENDING.with(|queue| !queue.borrow().is_empty()) {
-            platform::wake(self.0.borrow().wake);
-        }
     }
 }
 fn icon(color: [u8; 3]) -> Icon {
@@ -132,7 +140,9 @@ struct App {
     tab: usize,
     exit_requested: bool,
     context: egui::Context,
-    wake: isize,
+    actions: mpsc::Receiver<Action>,
+    _activity: platform::ActivityMonitor,
+    config_notice: Option<String>,
 }
 impl App {
     fn new(
@@ -141,6 +151,7 @@ impl App {
         mut load_error: Option<String>,
     ) -> Result<Self> {
         let ctx = &cc.egui_ctx;
+        let activity = platform::ActivityMonitor::new()?;
         // Reflect the current executable's registered state, rather than silently
         // re-enabling a startup item the user removed outside the application.
         match autostart::is_enabled() {
@@ -206,11 +217,17 @@ impl App {
             .unwrap_or_default();
         let visible = !config::config_path().exists() || load_error.is_some() || paused;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        let config_notice = load_error.clone();
         let status = if paused {
             "快捷键注册失败（可能已被占用），请修改并保存".into()
         } else {
             load_error.unwrap_or_else(|| "准备就绪 · 在输入框中按快捷键开始".into())
         };
+        let wake = platform::dispatch_window()?;
+        let (sender, actions) = mpsc::channel();
+        EVENTS
+            .set((sender, wake))
+            .map_err(|_| anyhow::anyhow!("后台事件通道已初始化"))?;
         Ok(Self {
             draft: saved.clone(),
             saved,
@@ -235,7 +252,9 @@ impl App {
             tab: 0,
             exit_requested: false,
             context: ctx.clone(),
-            wake: platform::dispatch_window()?,
+            actions,
+            _activity: activity,
+            config_notice,
         })
     }
     fn show(&mut self, ctx: &egui::Context) {
@@ -270,11 +289,12 @@ impl App {
         }
         self.hotkey = hotkey;
         self.saved = self.draft.clone();
+        self.config_notice = None;
         self.paused = false;
         self.status = "已保存 · 快捷键已生效".into();
         Ok(())
     }
-    fn start(&mut self, ctx: &egui::Context, test: bool) {
+    fn start(&mut self, ctx: &egui::Context, test: bool, target: Option<platform::Target>) {
         if self.busy || self.exit_requested {
             return;
         }
@@ -313,40 +333,42 @@ impl App {
         let cancel = self.cancel.clone();
         let tx = self.tx.clone();
         let ctx = ctx.clone();
-        let wake = self.wake;
         std::thread::spawn(move || {
-            let operation = || -> Result<(String, String)> {
+            let operation = || -> Result<(String, String, bool)> {
                 let (target, input) = if test {
                     (None, "please check this connection".into())
                 } else {
-                    let (target, text) = platform::capture(config.max_chars)?;
+                    let (target, text) = platform::capture(
+                        target.context("未记录触发时的输入窗口")?,
+                        config.max_chars,
+                    )?;
                     (Some(target), text)
                 };
                 ensure!(!cancel.load(Ordering::SeqCst), "已取消，原文未替换");
                 let _ = tx.send(WorkerEvent::Captured);
-                platform::wake(wake);
+                post_action(Action::Worker);
                 ctx.request_repaint();
                 let text = api::rewrite(&config, &key, &input)?;
                 ensure!(!cancel.load(Ordering::SeqCst), "已取消，原文未替换");
-                let status = if let Some(target) = target {
+                let (status, replaced) = if let Some(target) = target {
                     if config.auto_replace {
-                        match platform::paste(target, &text) {
-                            Ok(()) => "已发送替换 · 如需撤销，请在原输入框按 Ctrl+Z".into(),
-                            Err(e) => format!("{} · 可打开面板复制结果", e),
+                        match platform::paste(target, &input, &text, &cancel) {
+                            Ok(()) => ("已确认替换 · 如需撤销，请在原输入框按 Ctrl+Z".into(), true),
+                            Err(e) => (format!("{} · 可打开面板复制结果", e), false),
                         }
                     } else {
-                        "改写完成 · 打开面板复制结果".into()
+                        ("改写完成 · 自动替换已关闭，可打开面板复制结果".into(), true)
                     }
                 } else {
-                    "连接成功 · 模型已返回结果".into()
+                    ("连接成功 · 模型已返回结果".into(), true)
                 };
-                Ok((text, status))
+                Ok((text, status, replaced))
             };
             let event = match operation() {
-                Ok((text, status)) => WorkerEvent::Done {
+                Ok((text, status, success)) => WorkerEvent::Done {
                     text: Some(text),
                     status,
-                    success: true,
+                    success,
                 },
                 Err(e) => WorkerEvent::Done {
                     text: None,
@@ -355,7 +377,7 @@ impl App {
                 },
             };
             let _ = tx.send(event);
-            platform::wake(wake);
+            post_action(Action::Worker);
             ctx.request_repaint();
         });
     }
@@ -466,6 +488,9 @@ impl eframe::App for App {
             });
             ui.horizontal(|ui| { for (index, label) in ["连接与快捷键", "写作规则", "最近结果"].into_iter().enumerate() { ui.selectable_value(&mut self.tab, index, label); } });
             ui.separator();
+            if let Some(notice) = &self.config_notice {
+                ui.label(RichText::new(notice).color(Color32::from_rgb(255, 188, 110)));
+            }
             egui::ScrollArea::vertical().max_height((ui.available_height() - 110.).max(100.)).show(ui, |ui| {
                 if self.tab == 0 {
                     ui.add_enabled_ui(!self.busy, |ui| {
@@ -512,7 +537,7 @@ impl eframe::App for App {
                 if ui.add_enabled(!self.busy, egui::Button::new(RichText::new("保存设置").color(Color32::from_rgb(17, 24, 32))).fill(MINT)).clicked() {
                     if let Err(e) = self.save() { self.status = e.to_string(); }
                 }
-                if ui.add_enabled(!self.busy, egui::Button::new("测试连接")).clicked() { self.start(ctx, true); }
+                if ui.add_enabled(!self.busy, egui::Button::new("测试连接")).clicked() { self.start(ctx, true, None); }
                 if self.busy && ui.button("取消").clicked() { self.cancel.store(true, Ordering::SeqCst); self.status = "已请求取消…".into(); }
                 if ui.button("收起到托盘").clicked() { self.visible = false; ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)); }
             });
@@ -546,8 +571,8 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
-    let (saved, error) = match Config::load() {
-        Ok(c) => (c, None),
+    let (saved, error) = match Config::load_with_notice() {
+        Ok(loaded) => loaded,
         Err(e) => (
             Config::default(),
             Some(format!("配置读取失败，请重新设置：{e}")),
@@ -573,10 +598,12 @@ fn main() -> eframe::Result<()> {
             ACTIVE.with(|active| *active.borrow_mut() = Rc::downgrade(&app));
             GlobalHotKeyEvent::set_event_handler(Some(|event: GlobalHotKeyEvent| {
                 if event.state == HotKeyState::Pressed {
-                    dispatch(Action::Hotkey(event));
+                    // Snapshot the destination before any foreground UI changes.
+                    let target = platform::Target::current().map_err(|error| error.to_string());
+                    post_action(Action::Hotkey(event, target));
                 }
             }));
-            MenuEvent::set_event_handler(Some(|event| dispatch(Action::Menu(event))));
+            MenuEvent::set_event_handler(Some(|event| post_action(Action::Menu(event))));
             Ok(Box::new(Shell(app)) as Box<dyn eframe::App>)
         }),
     );
