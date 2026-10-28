@@ -2,16 +2,18 @@
 mod api;
 mod autostart;
 mod config;
+mod hotkeys;
 mod platform;
+mod popup;
 
 use anyhow::{ensure, Context, Result};
 use config::{credential, Config};
 use eframe::egui::{self, Color32, RichText};
-use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use hotkeys::Hotkeys;
 use std::{
     cell::RefCell,
     rc::{Rc, Weak},
-    str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, OnceLock,
@@ -57,12 +59,24 @@ fn drain_actions() {
         while let Ok(action) = app.actions.try_recv() {
             match action {
                 Action::Hotkey(event, target) => {
-                    if event.id == app.hotkey.id() && !app.paused && !app.busy {
-                        match target {
-                            Ok(target) => app.start(&ctx, false, Some(target)),
-                            Err(error) => {
-                                app.status = error;
-                                let _ = app.tray.set_icon(Some(icon([255, 188, 110])));
+                    if !app.paused && !app.busy {
+                        let kind = if event.id == app.hotkeys.rewrite.id() {
+                            Some(JobKind::Rewrite)
+                        } else if event.id == app.hotkeys.translate.id() {
+                            Some(JobKind::Translate)
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = kind {
+                            match target {
+                                Ok(target) => app.start(&ctx, kind, Some(target)),
+                                Err(error) => {
+                                    app.status = error.clone();
+                                    let _ = app.tray.set_icon(Some(icon([255, 188, 110])));
+                                    if kind == JobKind::Translate {
+                                        app.show_translation_error(&error);
+                                    }
+                                }
                             }
                         }
                     }
@@ -99,18 +113,20 @@ fn icon(color: [u8; 3]) -> Icon {
     }
     Icon::from_rgba(rgba, 32, 32).unwrap()
 }
-fn parse_hotkey(text: &str) -> Result<HotKey> {
-    let hotkey =
-        HotKey::from_str(text).context("快捷键格式示例：Alt+KeyF 或 Control+Shift+KeyE")?;
-    ensure!(
-        !hotkey.mods.is_empty(),
-        "快捷键至少需要 Alt、Control 或 Shift 修饰键"
-    );
-    Ok(hotkey)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobKind {
+    Rewrite,
+    Translate,
+    Test,
 }
 enum WorkerEvent {
-    Captured,
+    Captured {
+        kind: JobKind,
+        request: u64,
+    },
     Done {
+        kind: JobKind,
+        request: u64,
         text: Option<String>,
         status: String,
         success: bool,
@@ -122,7 +138,12 @@ struct App {
     key: String,
     show_key: bool,
     manager: GlobalHotKeyManager,
-    hotkey: HotKey,
+    hotkeys: Hotkeys,
+    translation_menu: MenuItem,
+    translation_result: String,
+    popup: popup::TranslationPopup,
+    popup_started: bool,
+    request: u64,
     tray: TrayIcon,
     settings: MenuItem,
     pause: MenuItem,
@@ -197,15 +218,17 @@ impl App {
             ctx.set_fonts(fonts);
         }
         let manager = GlobalHotKeyManager::new()?;
-        let hotkey = parse_hotkey(&saved.hotkey).or_else(|_| parse_hotkey("Alt+KeyF"))?;
-        let registration = manager.register(hotkey);
+        let hotkeys =
+            Hotkeys::from_config(&saved).or_else(|_| Hotkeys::from_config(&Config::default()))?;
+        let registration = hotkeys.prepare(&manager, None);
         let paused = registration.is_err();
         let menu = Menu::new();
         let settings = MenuItem::new("打开 FluentKey / 设置", true, None);
+        let translation_menu = MenuItem::new("查看最近中文翻译", true, None);
         let pause = MenuItem::new("暂停 / 恢复快捷键", true, None);
-        let cancel_menu = MenuItem::new("取消当前改写", true, None);
+        let cancel_menu = MenuItem::new("取消当前任务", true, None);
         let quit = MenuItem::new("退出 FluentKey", true, None);
-        menu.append_items(&[&settings, &pause, &cancel_menu, &quit])?;
+        menu.append_items(&[&settings, &translation_menu, &pause, &cancel_menu, &quit])?;
         let tray = TrayIconBuilder::new()
             .with_tooltip("FluentKey · 随手写，自然说")
             .with_icon(icon([114, 232, 190]))
@@ -234,7 +257,12 @@ impl App {
             key,
             show_key: false,
             manager,
-            hotkey,
+            hotkeys,
+            translation_menu,
+            translation_result: String::new(),
+            popup: popup::TranslationPopup::default(),
+            popup_started: false,
+            request: 0,
             tray,
             settings,
             pause,
@@ -266,53 +294,85 @@ impl App {
     fn save(&mut self) -> Result<()> {
         self.draft.validate()?;
         ensure!(!self.key.trim().is_empty(), "请填写 API Key");
-        let hotkey = parse_hotkey(&self.draft.hotkey)?;
-        let changed = hotkey != self.hotkey;
-        if changed || self.paused {
-            self.manager
-                .register(hotkey)
-                .context("快捷键已被占用，请换一个组合")?;
-        }
+        let hotkeys = Hotkeys::from_config(&self.draft)?;
+        let added = hotkeys.prepare(
+            &self.manager,
+            if self.paused {
+                None
+            } else {
+                Some(self.hotkeys)
+            },
+        )?;
         // Roll back new registration if persistence fails. Old shortcut keeps working.
         let persist = autostart::save_with(self.draft.start_at_login, || -> Result<()> {
             credential()?.set_password(self.key.trim())?;
             self.draft.save()
         });
         if let Err(error) = persist {
-            if changed || self.paused {
-                let _ = self.manager.unregister(hotkey);
+            for key in added {
+                let _ = self.manager.unregister(key);
             }
             return Err(error);
         }
-        if changed && !self.paused {
-            let _ = self.manager.unregister(self.hotkey);
+        if !self.paused {
+            for key in self.hotkeys.removals(hotkeys) {
+                let _ = self.manager.unregister(key);
+            }
         }
-        self.hotkey = hotkey;
+        self.hotkeys = hotkeys;
+        self.popup.set_auto_close(self.draft.translation_auto_close);
         self.saved = self.draft.clone();
         self.config_notice = None;
         self.paused = false;
         self.status = "已保存 · 快捷键已生效".into();
         Ok(())
     }
-    fn start(&mut self, ctx: &egui::Context, test: bool, target: Option<platform::Target>) {
+    fn show_translation_error(&mut self, error: &str) {
+        self.request = self.request.wrapping_add(1);
+        if self
+            .popup
+            .loading(self.request, self.saved.translation_auto_close)
+            .is_ok()
+        {
+            self.popup.finish(self.request, Err(error));
+        }
+    }
+    fn show_last_translation(&mut self) {
+        if self.translation_result.is_empty() {
+            self.status = "暂无中文译文，请先选中文字并按翻译快捷键".into();
+            return;
+        }
+        self.request = self.request.wrapping_add(1);
+        match self
+            .popup
+            .loading(self.request, self.saved.translation_auto_close)
+        {
+            Ok(()) => {
+                self.popup
+                    .finish(self.request, Ok(&self.translation_result));
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+    fn start(&mut self, ctx: &egui::Context, kind: JobKind, target: Option<platform::Target>) {
         if self.busy || self.exit_requested {
             return;
         }
-        let config = if test {
+        let config = if kind == JobKind::Test {
             self.draft.clone()
         } else {
             self.saved.clone()
         };
-        if let Err(e) = config.validate() {
-            self.status = e.to_string();
+        if let Err(error) = config.validate() {
+            self.status = error.to_string();
             self.show(ctx);
             return;
         }
-        let key = if test {
+        let key = if kind == JobKind::Test {
             self.key.clone()
         } else {
             credential()
-                .and_then(|e| Ok(e.get_password()?))
+                .and_then(|entry| Ok(entry.get_password()?))
                 .unwrap_or_default()
         };
         if key.trim().is_empty() {
@@ -323,10 +383,16 @@ impl App {
         self.busy = true;
         self.started = Instant::now();
         self.cancel.store(false, Ordering::SeqCst);
-        self.status = if test {
-            "正在测试连接…"
-        } else {
-            "正在读取输入框…"
+        self.request = self.request.wrapping_add(1);
+        let request = self.request;
+        if kind == JobKind::Translate {
+            self.popup.close();
+            self.popup_started = false;
+        }
+        self.status = match kind {
+            JobKind::Test => "正在测试连接…",
+            JobKind::Rewrite => "正在读取输入框…",
+            JobKind::Translate => "正在复制所选文字…",
         }
         .into();
         let _ = self.tray.set_icon(Some(icon([120, 176, 255])));
@@ -335,44 +401,67 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let operation = || -> Result<(String, String, bool)> {
-                let (target, input) = if test {
-                    (None, "please check this connection".into())
-                } else {
-                    let (target, text) = platform::capture(
-                        target.context("未记录触发时的输入窗口")?,
-                        config.max_chars,
-                    )?;
-                    (Some(target), text)
+                let (destination, input) = match kind {
+                    JobKind::Test => (None, "please check this connection".into()),
+                    JobKind::Rewrite => {
+                        let (target, text) = platform::capture(
+                            target.context("未记录触发时的目标窗口")?,
+                            config.max_chars,
+                        )?;
+                        (Some(target), text)
+                    }
+                    JobKind::Translate => (
+                        None,
+                        platform::capture_selection(
+                            target.context("未记录触发时的目标窗口")?,
+                            config.max_chars,
+                        )?,
+                    ),
                 };
-                ensure!(!cancel.load(Ordering::SeqCst), "已取消，原文未替换");
-                let _ = tx.send(WorkerEvent::Captured);
+                ensure!(!cancel.load(Ordering::SeqCst), "已取消当前任务");
+                let _ = tx.send(WorkerEvent::Captured { kind, request });
                 post_action(Action::Worker);
                 ctx.request_repaint();
-                let text = api::rewrite(&config, &key, &input)?;
-                ensure!(!cancel.load(Ordering::SeqCst), "已取消，原文未替换");
-                let (status, replaced) = if let Some(target) = target {
-                    if config.auto_replace {
-                        match platform::paste(target, &input, &text, &cancel) {
-                            Ok(()) => ("已确认替换 · 如需撤销，请在原输入框按 Ctrl+Z".into(), true),
-                            Err(e) => (format!("{} · 可打开面板复制结果", e), false),
-                        }
-                    } else {
+                let text = if kind == JobKind::Translate {
+                    api::translate(&config, &key, &input)?
+                } else {
+                    api::rewrite(&config, &key, &input)?
+                };
+                ensure!(!cancel.load(Ordering::SeqCst), "已取消当前任务");
+                let (status, success) = match kind {
+                    JobKind::Translate => (
+                        "中文翻译完成 · 可在悬浮窗复制，也可从托盘重新打开".into(),
+                        true,
+                    ),
+                    JobKind::Test => ("连接成功 · 模型已返回结果".into(), true),
+                    JobKind::Rewrite if config.auto_replace => match platform::paste(
+                        destination.context("未记录回填目标")?,
+                        &input,
+                        &text,
+                        &cancel,
+                    ) {
+                        Ok(()) => ("已确认替换 · 如需撤销，请在原输入框按 Ctrl+Z".into(), true),
+                        Err(error) => (format!("{error} · 可打开面板复制结果"), false),
+                    },
+                    JobKind::Rewrite => {
                         ("改写完成 · 自动替换已关闭，可打开面板复制结果".into(), true)
                     }
-                } else {
-                    ("连接成功 · 模型已返回结果".into(), true)
                 };
-                Ok((text, status, replaced))
+                Ok((text, status, success))
             };
             let event = match operation() {
                 Ok((text, status, success)) => WorkerEvent::Done {
+                    kind,
+                    request,
                     text: Some(text),
                     status,
                     success,
                 },
-                Err(e) => WorkerEvent::Done {
+                Err(error) => WorkerEvent::Done {
+                    kind,
+                    request,
                     text: None,
-                    status: e.to_string(),
+                    status: error.to_string(),
                     success: false,
                 },
             };
@@ -387,9 +476,9 @@ impl App {
             return;
         }
         let result = if self.paused {
-            self.manager.register(self.hotkey)
+            self.hotkeys.prepare(&self.manager, None).map(|_| ())
         } else {
-            self.manager.unregister(self.hotkey)
+            self.hotkeys.unregister(&self.manager)
         };
         match result {
             Ok(()) => {
@@ -412,11 +501,17 @@ impl App {
     fn exit(&self) -> ! {
         // No worker is active here, so clipboard guards have finished restoring.
         let _ = self.tray.set_visible(false);
+        // Close native windows before terminating; active worker guards finished.
+        unsafe {
+            popup::close_active();
+        }
         std::process::exit(0)
     }
     fn menu_event(&mut self, event: MenuEvent, ctx: &egui::Context) {
         if event.id == self.settings.id() {
             self.show(ctx);
+        } else if event.id == self.translation_menu.id() {
+            self.show_last_translation();
         } else if event.id == self.pause.id() {
             self.toggle_pause();
         } else if event.id == self.cancel_menu.id() {
@@ -434,8 +529,23 @@ impl App {
     fn pump_worker(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                WorkerEvent::Captured => self.status = "正在优化英文… 请暂时不要操作键鼠".into(),
+                WorkerEvent::Captured { kind, request } => {
+                    if kind == JobKind::Translate {
+                        self.status = "正在翻译为中文…".into();
+                        self.popup_started = true;
+                        if let Err(error) = self
+                            .popup
+                            .loading(request, self.saved.translation_auto_close)
+                        {
+                            self.status = error.to_string();
+                        }
+                    } else {
+                        self.status = "正在优化英文… 请保持原输入框焦点".into();
+                    }
+                }
                 WorkerEvent::Done {
+                    kind,
+                    request,
                     text,
                     status,
                     success,
@@ -445,7 +555,22 @@ impl App {
                     if self.exit_requested {
                         self.exit();
                     }
-                    if let Some(text) = text {
+                    if kind == JobKind::Translate {
+                        if !self.popup_started {
+                            let _ = self
+                                .popup
+                                .loading(request, self.saved.translation_auto_close);
+                        }
+                        match text {
+                            Some(text) => {
+                                self.popup.finish(request, Ok(&text));
+                                self.translation_result = text;
+                            }
+                            None => {
+                                self.popup.finish(request, Err(&self.status));
+                            }
+                        }
+                    } else if let Some(text) = text {
                         self.result = text;
                     }
                     let _ = self.tray.set_icon(Some(icon(if success {
@@ -477,16 +602,17 @@ impl eframe::App for App {
             ui.add_space(8.);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("F").size(34.).color(MINT).strong());
-                ui.vertical(|ui| { ui.label(RichText::new("FluentKey").size(25.).strong()); ui.label(RichText::new("随手写，自然说。").color(Color32::GRAY)); });
+                ui.vertical(|ui| { ui.label(RichText::new("FluentKey").size(25.).strong()); ui.label(RichText::new(concat!("v",env!("CARGO_PKG_VERSION")," · 随手写，自然说。")).color(Color32::GRAY)); });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(RichText::new(if self.busy { "● WORKING" } else if self.paused { "● PAUSED" } else { "● READY" }).color(MINT).size(12.)); });
             });
             ui.add_space(8.);
             egui::Frame::group(ui.style()).inner_margin(16.).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| { ui.label(RichText::new(self.saved.hotkey.replace("Key", "")).size(20.).color(MINT)); ui.label("选中文字 → 优化英文 → 原位替换"); });
-                ui.label(RichText::new("光标放在输入框中即可。请求期间继续输入会停止自动回填。").size(12.).color(Color32::GRAY));
+                ui.horizontal(|ui| { ui.label(RichText::new(self.saved.hotkey.replace("Key", "")).size(20.).color(MINT)); ui.label("输入框 → 英文润色 → 原位替换"); });
+                ui.horizontal(|ui| { ui.label(RichText::new(self.saved.translation_hotkey.replace("Key", "")).size(20.).color(MINT)); ui.label("选中文字 → 中文翻译 → 悬浮窗"); });
+                ui.label(RichText::new("中文翻译只读取当前选区，可用于聊天记录或网页，不会替换原文。").size(12.).color(Color32::GRAY));
             });
-            ui.horizontal(|ui| { for (index, label) in ["连接与快捷键", "写作规则", "最近结果"].into_iter().enumerate() { ui.selectable_value(&mut self.tab, index, label); } });
+            ui.horizontal(|ui| { for (index, label) in ["连接与快捷键", "写作规则", "英文结果", "中文译文"].into_iter().enumerate() { ui.selectable_value(&mut self.tab, index, label); } });
             ui.separator();
             if let Some(notice) = &self.config_notice {
                 ui.label(RichText::new(notice).color(Color32::from_rgb(255, 188, 110)));
@@ -506,22 +632,27 @@ impl eframe::App for App {
                         });
                         ui.label(RichText::new("Key 保存在 Windows 凭据管理器，不写入配置文件。").size(12.).color(Color32::GRAY));
                         field(ui, "Model · 填写供应商提供的模型 ID", &mut self.draft.model, "例如你的模型 ID");
-                        field(ui, "全局快捷键", &mut self.draft.hotkey, "Alt+KeyF");
+                        field(ui, "英文润色快捷键", &mut self.draft.hotkey, "Alt+KeyF");
+                        field(ui, "中文翻译快捷键", &mut self.draft.translation_hotkey, "Alt+KeyD");
+                        ui.checkbox(&mut self.draft.translation_auto_close, "点击悬浮窗外的其他位置时自动关闭");
                         ui.label(RichText::new("示例：Alt+KeyF、Control+Shift+KeyE。冲突时保存会提示。").size(12.).color(Color32::GRAY));
                         ui.horizontal(|ui| {
                             ui.label("超时 / 秒"); ui.add(egui::DragValue::new(&mut self.draft.timeout_secs).range(5..=120));
                             ui.label("字符上限"); ui.add(egui::DragValue::new(&mut self.draft.max_chars).range(1..=50000));
                         });
-                        ui.checkbox(&mut self.draft.auto_replace, "完成后自动替换输入框中的文字");
+                        ui.checkbox(&mut self.draft.auto_replace, "英文润色完成后自动替换输入框中的文字");
                     });
                     ui.add_space(4.);
-                    ui.label(RichText::new("按快捷键会将整个输入框的文字发送给所配置的 API。请在非敏感文本框中使用；浏览器密码框和特殊编辑器无法保证识别。").size(12.).color(Color32::from_rgb(224, 185, 128)));
+                    ui.label(RichText::new("英文润色发送整个输入框；中文翻译仅发送当前所选文字。两者都使用已配置的 API，请避免选中敏感信息。").size(12.).color(Color32::from_rgb(224, 185, 128)));
                 } else if self.tab == 1 {
                     ui.label("保持原意 · 美式口语 · IT 行业表达 · 只输出译文");
                     ui.add_enabled(!self.busy, egui::TextEdit::multiline(&mut self.draft.prompt).desired_width(f32::INFINITY).desired_rows(14));
                     if ui.add_enabled(!self.busy, egui::Button::new("恢复默认规则")).clicked() { self.draft.prompt = config::PROMPT.into(); }
-                    ui.label("已去掉对话初始化时的“收到”要求，每次请求都独立翻译。");
-                } else {
+                    ui.separator();
+                    ui.label("选中文字 → 简体中文翻译规则");
+                    ui.add_enabled(!self.busy,egui::TextEdit::multiline(&mut self.draft.translation_prompt).desired_width(f32::INFINITY).desired_rows(8));
+                    if ui.add_enabled(!self.busy,egui::Button::new("恢复中文翻译规则")).clicked() { self.draft.translation_prompt = config::TRANSLATION_PROMPT.into(); }
+                } else if self.tab == 2 {
                     ui.label("仅保留本次运行中的最近一个结果，退出即清除。");
                     ui.add(egui::TextEdit::multiline(&mut self.result).desired_width(f32::INFINITY).desired_rows(13));
                     ui.horizontal(|ui| {
@@ -530,6 +661,15 @@ impl eframe::App for App {
                         }
                         if ui.button("清除结果").clicked() { self.result.clear(); }
                     });
+                } else {
+                    ui.label("最近一次中文译文 · 仅存本次运行内存");
+                    ui.add(egui::TextEdit::multiline(&mut self.translation_result).desired_width(f32::INFINITY).desired_rows(12));
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.translation_result.is_empty(),egui::Button::new("复制中文译文")).clicked() {
+                            self.status = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(self.translation_result.clone())) { Ok(()) => "已复制中文译文".into(),Err(_) => "复制失败，请重试".into() };
+                        }
+                        if ui.add_enabled(!self.busy && !self.translation_result.is_empty(),egui::Button::new("打开悬浮窗")).clicked() { self.show_last_translation(); }
+                    });
                 }
             });
             ui.separator();
@@ -537,7 +677,7 @@ impl eframe::App for App {
                 if ui.add_enabled(!self.busy, egui::Button::new(RichText::new("保存设置").color(Color32::from_rgb(17, 24, 32))).fill(MINT)).clicked() {
                     if let Err(e) = self.save() { self.status = e.to_string(); }
                 }
-                if ui.add_enabled(!self.busy, egui::Button::new("测试连接")).clicked() { self.start(ctx, true, None); }
+                if ui.add_enabled(!self.busy, egui::Button::new("测试连接")).clicked() { self.start(ctx, JobKind::Test, None); }
                 if self.busy && ui.button("取消").clicked() { self.cancel.store(true, Ordering::SeqCst); self.status = "已请求取消…".into(); }
                 if ui.button("收起到托盘").clicked() { self.visible = false; ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)); }
             });

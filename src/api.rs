@@ -19,6 +19,12 @@ struct Message {
 }
 
 pub fn rewrite(config: &Config, key: &str, input: &str) -> Result<String> {
+    complete(config, key, input, &config.prompt)
+}
+pub fn translate(config: &Config, key: &str, input: &str) -> Result<String> {
+    complete(config, key, input, &config.translation_prompt)
+}
+fn complete(config: &Config, key: &str, input: &str, prompt: &str) -> Result<String> {
     config.validate()?;
     if key.trim().is_empty() {
         bail!("请先在设置中填写 API Key");
@@ -30,7 +36,7 @@ pub fn rewrite(config: &Config, key: &str, input: &str) -> Result<String> {
         .build()?;
     let response = client.post(config.endpoint()?).bearer_auth(key.trim())
         .json(&json!({ "model": config.model.trim(), "stream": false,
-            "messages": [{"role": "system", "content": config.prompt}, {"role": "user", "content": input}] }))
+            "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": input}] }))
         .send().map_err(|e| if e.is_timeout() { anyhow::anyhow!("请求超时，请重试") } else { anyhow::anyhow!("无法连接 API，请检查地址和网络") })?;
     if !response.status().is_success() {
         // Never display server bodies: they can echo credentials or user text.
@@ -72,7 +78,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for status in [200, 401] {
+            for (index, status) in [200, 200, 401].into_iter().enumerate() {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -97,7 +103,22 @@ mod tests {
                             let body: serde_json::Value =
                                 serde_json::from_slice(&request[header_end + 4..]).unwrap();
                             assert_eq!(body["messages"][0]["role"], "system");
-                            assert_eq!(body["messages"][1]["content"], "测试原文");
+                            assert_eq!(
+                                body["messages"][0]["content"],
+                                if index == 1 {
+                                    crate::config::TRANSLATION_PROMPT
+                                } else {
+                                    crate::config::PROMPT
+                                }
+                            );
+                            assert_eq!(
+                                body["messages"][1]["content"],
+                                if index == 1 {
+                                    "Please check the deployment."
+                                } else {
+                                    "测试原文"
+                                }
+                            );
                             assert_eq!(body["model"], "fixture-model");
                             assert_eq!(body["stream"], false);
                             break;
@@ -105,9 +126,9 @@ mod tests {
                     }
                 }
                 let body = if status == 200 {
-                    r#"{"choices":[{"message":{"content":"Natural English."},"finish_reason":"stop"}]}"#
+                    json!({"choices":[{"message":{"content":if index==1 {"请检查部署情况。"} else {"Natural English."}},"finish_reason":"stop"}]}).to_string()
                 } else {
-                    "secret-from-server-must-not-appear"
+                    "secret-from-server-must-not-appear".into()
                 };
                 write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
@@ -120,6 +141,10 @@ mod tests {
         assert_eq!(
             rewrite(&c, "local-test-only", "测试原文").unwrap(),
             "Natural English."
+        );
+        assert_eq!(
+            translate(&c, "local-test-only", "Please check the deployment.").unwrap(),
+            "请检查部署情况。"
         );
         let error = rewrite(&c, "local-test-only", "测试原文")
             .unwrap_err()

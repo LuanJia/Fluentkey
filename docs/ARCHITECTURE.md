@@ -9,6 +9,8 @@
 | `src/config.rs` | 非敏感配置、默认提示词、URL 校验、系统凭据入口 |
 | `src/autostart.rs` | 当前用户登录启动项、带引号的绝对路径、保存失败回滚 |
 | `src/api.rs` | OpenAI 兼容 Chat Completions、超时、响应限制、错误归一化 |
+| `src/hotkeys.rs` | 两组快捷键解析、去重、增量注册、冲突回滚与互换 |
+| `src/popup.rs` | 独立 Win32 中文译文工具窗口、复制、窗外关闭与 DPI 布局 |
 
 主线程驱动 Win32 消息循环、托盘和界面。全局快捷键与托盘菜单使用线程安全的 mpsc 事件入口；每次入队立即 PostMessage 到独立 message-only 窗口，由该窗口所属线程访问控制器，不依赖 eframe 绘制。快捷键回调记录当时的目标焦点，避免延迟处理时读到其他窗口。按快捷键后将配置快照交给后台线程，执行捕获 → 网络请求 → 条件回填，通过通道及原生消息报告结果。最多一个后台任务。
 
@@ -33,6 +35,8 @@
 
 ## API 合约
 
+英文润色调用 `api::rewrite` 使用 `Config.prompt`；中文翻译调用 `api::translate` 使用 `Config.translation_prompt`。二者通过同一请求实现复用端点、Key、Model 和错误处理。
+
 ```
 POST {base_url}/chat/completions
 Authorization: Bearer <Windows Credential Manager 中的 Key>
@@ -47,6 +51,14 @@ Content-Type: application/json
 接受 `choices[0].message.content` 字符串。空内容、缺少结果、非标准 JSON、`finish_reason=length/content_filter` 均拒绝替换。响应上限 1 MiB；连接超时 10s，总请求超时默认 30s，可设 5–120s。不流式写入目标，不自动重试，不跟随重定向，避免 Key 跟随到意外目标。仅远程 HTTPS／本机 HTTP。
 
 ## 配置与生命周期
+
+v0.2.0 新增 `JobKind::Translate`，与 Rewrite/Test 共用单任务调度，但只调用 `capture_selection`（Ctrl+C），随后请求 API 并显示译文，绝不进入 paste。复制前等待快捷键释放并记录哨兵，等待剪贴板序列号变化；验证选区后恢复剪贴板，再创建加载悬浮窗。因此显示悬浮窗不会干扰读取源选区。
+
+悬浮窗为独立 Win32 `WS_EX_TOOLWINDOW | WS_EX_TOPMOST` 窗口，用 `SW_SHOWNOACTIVATE` 显示，原生消息循环不依赖隐藏的设置页 redraw。支持当前鼠标所在显示器的工作区定位、DPI 字体、可调整大小、只读多行编辑控件和复制按钮。窗口状态通过 GWLP_USERDATA 中的 RefCell 管理，避免系统控件的同步重入导致可变引用别名。
+
+原有低级鼠标钩子在按下鼠标按钮时仅比较屏幕点与悬浮窗矩形。开启自动关闭且点击窗外则 PostMessage(WM_CLOSE)；窗内点击、移动鼠标、仅失去键盘焦点不会关闭窗口。保存开关后立即更新现有窗口及后续窗口行为。每次翻译带请求标识，关闭后的句柄不再接受完成更新，不因后台返回而重弹；最近译文另存 App.translation_result 以便手动重开。
+
+快捷键增量注册集合为 new - old；保存成功后移除 old - new，失败则撤销新增注册。因此交换两个功能的组合不需要先解除现有注册；两组组合相同会被拒绝。新增配置字段均有 serde 默认值，旧 JSON 保持兼容。
 
 配置先写唯一命名的临时文件并 sync_all，再 rename 替换；写入前将现有有效 JSON 保留为 config.json.bak。加载主文件失败时优先恢复备份并持续显示提示，原损坏文件在用户保存前保留；主文件与备份都失败才显示默认设置和明确错误路径。Key 由 keyring windows-native 后端存储，不参与序列化。快捷键修改先注册新组合，再持久化，成功后解除旧组合；失败撤销新注册。Key 存储和 JSON 存储不具有跨系统原子事务：极少数 JSON 写入失败场景，Key 可能已经更新，状态会明确报告保存失败。
 

@@ -87,6 +87,12 @@ unsafe extern "system" fn mouse_activity(code: i32, w: WPARAM, l: LPARAM) -> LRE
         let event = &*(l as *const MSLLHOOKSTRUCT);
         if event.dwExtraInfo != INPUT_TAG {
             USER_REVISION.fetch_add(1, Ordering::SeqCst);
+            if matches!(
+                w as u32,
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+            ) {
+                crate::popup::mouse_down(event.pt);
+            }
         }
     }
     CallNextHookEx(null_mut(), code, w, l)
@@ -160,7 +166,7 @@ fn focus() -> (isize, isize) {
 impl Target {
     pub fn current() -> Result<Self> {
         let (window, focus) = focus();
-        ensure!(window != 0 && focus != 0, "无法识别输入焦点");
+        ensure!(window != 0, "无法识别目标窗口");
         let mut pid = 0;
         unsafe {
             GetWindowThreadProcessId(window as HWND, &mut pid);
@@ -392,7 +398,38 @@ impl Drop for Snapshot {
         }
     }
 }
+#[cfg(test)]
+pub(crate) struct TestClipboard {
+    snapshot: Snapshot,
+    expected: String,
+}
+#[cfg(test)]
+pub(crate) fn preserve_clipboard_for_test(expected: &str) -> Result<TestClipboard> {
+    Ok(TestClipboard {
+        snapshot: Snapshot::take()?,
+        expected: expected.into(),
+    })
+}
+#[cfg(test)]
+impl Drop for TestClipboard {
+    fn drop(&mut self) {
+        if arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.get_text())
+            .is_ok_and(|text| text.replace("\r\n", "\n") == self.expected.replace("\r\n", "\n"))
+        {
+            self.snapshot.claim();
+        }
+    }
+}
 pub fn capture(target: Target, max_chars: usize) -> Result<(Target, String)> {
+    ensure!(target.focus != 0, "请将光标放在可编辑输入框中");
+    capture_text(target, max_chars, true)
+}
+/// Copy only the existing selection. Never inject Ctrl+A or Ctrl+V here.
+pub fn capture_selection(target: Target, max_chars: usize) -> Result<String> {
+    Ok(capture_text(target, max_chars, false)?.1)
+}
+fn capture_text(target: Target, max_chars: usize, select_all: bool) -> Result<(Target, String)> {
     wait_release()?;
     ensure!(target.same_focus(), "焦点已改变，请重试");
     let target = Target {
@@ -407,8 +444,10 @@ pub fn capture(target: Target, max_chars: usize) -> Result<(Target, String)> {
     snapshot.claim();
     let marker_sequence = unsafe { GetClipboardSequenceNumber() };
     ensure!(target.untouched(), "读取期间检测到输入或焦点变化，请重试");
-    keys(0x41)?;
-    thread::sleep(Duration::from_millis(65));
+    if select_all {
+        keys(0x41)?;
+        thread::sleep(Duration::from_millis(65));
+    }
     ensure!(target.untouched(), "读取期间检测到输入或焦点变化，请重试");
     keys(0x43)?;
     let deadline = Instant::now() + Duration::from_millis(900);
@@ -423,13 +462,24 @@ pub fn capture(target: Target, max_chars: usize) -> Result<(Target, String)> {
             }
         }
         if Instant::now() >= deadline {
-            bail!("未能复制文字，请确认光标在可编辑输入框中");
+            bail!(if select_all {
+                "未能复制文字，请确认光标在可编辑输入框中"
+            } else {
+                "未能复制选区，请先用鼠标选中可复制的文字"
+            });
         }
         thread::sleep(Duration::from_millis(20));
     };
     ensure!(target.untouched(), "读取期间检测到输入或焦点变化，已停止");
     snapshot.restore()?;
-    ensure!(!text.trim().is_empty(), "输入框为空");
+    ensure!(
+        !text.trim().is_empty(),
+        if select_all {
+            "输入框为空"
+        } else {
+            "没有选中可翻译的文字"
+        }
+    );
     ensure!(
         text.chars().count() <= max_chars,
         "文字超过字符上限，已停止发送"
@@ -648,6 +698,38 @@ mod tests {
         );
         let edit_id = edit as isize;
         let worker = thread::spawn(move || -> Result<()> {
+            // A selected range in a read-only control simulates chat history.
+            unsafe {
+                SendMessageW(edit_id as HWND, EM_SETREADONLY, 1, 0);
+                SendMessageW(edit_id as HWND, EM_SETSEL, 8, 13);
+            }
+            let selection = capture_selection(destination, 12000)?;
+            ensure!(
+                selection == "check",
+                "Selection capture selected the wrong range or used Ctrl+A"
+            );
+            let mut contents = [0u16; 128];
+            let len = unsafe {
+                GetWindowTextW(
+                    edit_id as HWND,
+                    contents.as_mut_ptr(),
+                    contents.len() as i32,
+                )
+            };
+            ensure!(
+                String::from_utf16_lossy(&contents[..len as usize]) == "can you check this bug",
+                "Selection capture changed the source"
+            );
+            unsafe {
+                SendMessageW(edit_id as HWND, EM_SETSEL, 0, 0);
+            }
+            ensure!(
+                capture_selection(destination, 12000).is_err(),
+                "Empty selection used stale clipboard text"
+            );
+            unsafe {
+                SendMessageW(edit_id as HWND, EM_SETREADONLY, 0, 0);
+            }
             let (target, original) = capture(destination, 12000)?;
             ensure!(
                 original == "can you check this bug",
